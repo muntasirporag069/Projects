@@ -1,0 +1,161 @@
+import streamlit as st
+import torch
+import numpy as np
+from transformers import BertForSequenceClassification, BertTokenizer
+from lime.lime_text import LimeTextExplainer
+import re
+
+# Force CPU usage
+device = torch.device("cpu")
+torch.set_num_threads(4)  # Limit CPU threads to prevent overloading
+
+# Custom CSS
+def load_css():
+    st.markdown("""
+    <style>
+        .main {
+            max-width: 800px;
+            padding: 2rem;
+        }
+        .stTextInput textarea, .stTextArea textarea {
+            font-size: 16px !important;
+            padding: 15px !important;
+        }
+        .prediction-card {
+            border-radius: 10px;
+            padding: 20px;
+            margin: 10px 0;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .negative { background-color: #ffebee; }
+        .neutral { background-color: #e3f2fd; }
+        .positive { background-color: #e8f5e9; }
+        .probability-bar {
+            height: 20px;
+            border-radius: 10px;
+            margin: 5px 0;
+        }
+        .explainer {
+            border: 1px solid #eee;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 20px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+# Text preprocessing
+def preprocess_text(text):
+    text = str(text).lower()
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\@\w+|\#', '', text)
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\d', ' ', text)
+    text = re.sub(r'\s+[a-z]\s+', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+# Load model with caching (modified for CPU)
+@st.cache_resource
+def load_model():
+    model = BertForSequenceClassification.from_pretrained(
+        "bert_sentiment_model",
+        device_map="auto",
+        torch_dtype=torch.float32
+    ).to(device)
+    
+    tokenizer = BertTokenizer.from_pretrained("bert_sentiment_model")
+    return model, tokenizer
+
+class SentimentAnalyzer:
+    def __init__(self):
+        self.model, self.tokenizer = load_model()
+        self.class_names = ['Negative', 'Neutral', 'Positive']
+        self.explainer = LimeTextExplainer(class_names=self.class_names)
+    
+    def predict_proba(self, texts):
+        if isinstance(texts, str):
+            texts = [texts]
+        
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=64,  # Reduced from 128 to save memory
+            return_tensors="pt"
+        ).to(device)
+        
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            probs = torch.nn.functional.softmax(outputs.logits, dim=1)
+        
+        return probs.cpu().numpy()
+    
+    def explain(self, text, num_features=5):  # Reduced features for CPU
+        exp = self.explainer.explain_instance(
+            preprocess_text(text),
+            self.predict_proba,
+            num_features=num_features,
+            top_labels=1
+        )
+        return exp
+
+# Initialize app
+load_css()
+analyzer = SentimentAnalyzer()
+
+# --- UI Components ---
+st.title("✈️ Airline Sentiment Analyzer (CPU Mode)")
+st.markdown("Analyze tweet sentiment using CPU-optimized BERT model")
+
+# Input Section
+with st.form("input_form"):
+    user_input = st.text_area(
+        "Enter an airline tweet:", 
+        "My flight was delayed but the crew was helpful",
+        height=100
+    )
+    submitted = st.form_submit_button("Analyze")
+
+# Results Section
+if submitted and user_input:
+    with st.spinner("Analyzing sentiment (this may take a few seconds)..."):
+        try:
+            # Predict
+            clean_text = preprocess_text(user_input)
+            probs = analyzer.predict_proba(clean_text)[0]
+            pred_class = np.argmax(probs)
+            
+            # Display prediction
+            st.success(f"Prediction: {analyzer.class_names[pred_class]} (Confidence: {probs[pred_class]:.1%})")
+            
+            # Probability bars
+            st.subheader("Probabilities")
+            for cls, prob in zip(analyzer.class_names, probs):
+                st.progress(float(prob), text=f"{cls}: {prob:.1%}")
+            
+            # Generate explanation (with memory safety)
+            with st.expander("Show Explanation (May be slow)"):
+                try:
+                    exp = analyzer.explain(clean_text)
+                    st.components.v1.html(exp.as_html(), height=600)
+                except Exception as e:
+                    st.warning(f"Couldn't generate full explanation: {str(e)}")
+                    st.info("Try shorter text or fewer features")
+        
+        except Exception as e:
+            st.error(f"Error during analysis: {str(e)}")
+            st.info("Try a shorter text input")
+
+# Sidebar with examples
+with st.sidebar:
+    st.header("Example Tweets")
+    examples = [
+        "Flight was on time and comfortable",
+        "Lost my luggage and poor customer service",
+        "Average experience, nothing special"
+    ]
+    
+    for ex in examples:
+        if st.button(ex, key=ex):
+            st.session_state.user_input = ex
